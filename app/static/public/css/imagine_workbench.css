@@ -224,8 +224,20 @@ body {
   width: 100%;
   display: block;
   box-sizing: border-box;
+  min-height: 150px;
+  padding-left: 112px;
   padding-right: 116px;
   padding-bottom: 44px;
+}
+
+.field .prompt-enhance-wrap > .inline-submit-btn {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 3;
+  height: 30px;
+  min-width: 88px;
+  padding: 0 10px;
 }
 
 .field .prompt-enhance-wrap > .prompt-enhance-btn {
@@ -243,6 +255,10 @@ body {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+}
+
+.action-row.action-row-inline {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .edit-progress-wrap {
