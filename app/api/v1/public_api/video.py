@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 import uuid
 from typing import Optional, List, Dict, Any
@@ -6,12 +7,13 @@ from typing import Optional, List, Dict, Any
 import orjson
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.auth import verify_public_key
 from app.core.logger import logger
 from app.services.grok.services.video import VideoService
 from app.services.grok.services.model import ModelService
+from app.api.v1.public_api import imagine as imagine_public_api
 
 router = APIRouter()
 
@@ -33,6 +35,35 @@ _VIDEO_RATIO_MAP = {
 }
 
 
+def _extract_parent_post_id_from_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", text):
+        return text
+    for pattern in (
+        r"/generated/([0-9a-fA-F-]{32,36})(?:/|$)",
+        r"/imagine-public/images/([0-9a-fA-F-]{32,36})(?:\.jpg|/|$)",
+        r"/images/([0-9a-fA-F-]{32,36})(?:\.jpg|/|$)",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    matches = re.findall(r"([0-9a-fA-F-]{32,36})", text)
+    return matches[-1] if matches else ""
+
+
+def _build_imagine_public_url(parent_post_id: str) -> str:
+    return f"https://imagine-public.x.ai/imagine-public/images/{parent_post_id}.jpg"
+
+
+def _mask_token(token: str) -> str:
+    raw = str(token or "").replace("sso=", "")
+    if len(raw) <= 12:
+        return raw or "-"
+    return f"{raw[:6]}...{raw[-6:]}"
+
+
 async def _clean_sessions(now: float) -> None:
     expired = [
         key
@@ -50,6 +81,8 @@ async def _new_session(
     resolution_name: str,
     preset: str,
     image_url: Optional[str],
+    parent_post_id: Optional[str],
+    source_image_url: Optional[str],
     reasoning_effort: Optional[str],
 ) -> str:
     task_id = uuid.uuid4().hex
@@ -63,6 +96,8 @@ async def _new_session(
             "resolution_name": resolution_name,
             "preset": preset,
             "image_url": image_url,
+            "parent_post_id": parent_post_id,
+            "source_image_url": source_image_url,
             "reasoning_effort": reasoning_effort,
             "created_at": now,
         }
@@ -123,21 +158,31 @@ def _validate_image_url(image_url: str) -> None:
     )
 
 
+def _validate_parent_post_id(parent_post_id: str) -> str:
+    value = (parent_post_id or "").strip()
+    if not value:
+        return ""
+    if not re.fullmatch(r"[0-9a-fA-F-]{32,36}", value):
+        raise HTTPException(status_code=400, detail="parent_post_id format is invalid")
+    return value
+
+
 class VideoStartRequest(BaseModel):
-    prompt: str
+    prompt: Optional[str] = ""
     aspect_ratio: Optional[str] = "3:2"
     video_length: Optional[int] = 6
     resolution_name: Optional[str] = "480p"
     preset: Optional[str] = "normal"
+    concurrent: Optional[int] = Field(1, ge=1, le=4)
     image_url: Optional[str] = None
+    parent_post_id: Optional[str] = None
+    source_image_url: Optional[str] = None
     reasoning_effort: Optional[str] = None
 
 
 @router.post("/video/start", dependencies=[Depends(verify_public_key)])
 async def public_video_start(data: VideoStartRequest):
     prompt = (data.prompt or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
     aspect_ratio = _normalize_ratio(data.aspect_ratio)
     if not aspect_ratio:
@@ -165,10 +210,30 @@ async def public_video_start(data: VideoStartRequest):
             status_code=400,
             detail="preset must be one of ['fun','normal','spicy','custom']",
         )
+    concurrent = int(data.concurrent or 1)
+    if concurrent < 1 or concurrent > 4:
+        raise HTTPException(status_code=400, detail="concurrent must be between 1 and 4")
 
     image_url = (data.image_url or "").strip() or None
     if image_url:
         _validate_image_url(image_url)
+    parent_post_id = _validate_parent_post_id(data.parent_post_id or "")
+    source_image_url = (data.source_image_url or "").strip() or None
+    if parent_post_id:
+        # parentPostId 链路强制使用 imagine-public，避免误用 assets.grok.com。
+        source_image_url = _build_imagine_public_url(parent_post_id)
+    elif source_image_url:
+        _validate_image_url(source_image_url)
+
+    if parent_post_id and image_url:
+        raise HTTPException(
+            status_code=400, detail="image_url and parent_post_id cannot be used together"
+        )
+    if not prompt and not image_url and not parent_post_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt cannot be empty when no image_url/parent_post_id is provided",
+        )
 
     reasoning_effort = (data.reasoning_effort or "").strip() or None
     if reasoning_effort:
@@ -179,16 +244,28 @@ async def public_video_start(data: VideoStartRequest):
                 detail=f"reasoning_effort must be one of {sorted(allowed)}",
             )
 
-    task_id = await _new_session(
-        prompt,
-        aspect_ratio,
-        video_length,
-        resolution_name,
-        preset,
-        image_url,
-        reasoning_effort,
-    )
-    return {"task_id": task_id, "aspect_ratio": aspect_ratio}
+    task_ids: List[str] = []
+    for _ in range(concurrent):
+        task_id = await _new_session(
+            prompt,
+            aspect_ratio,
+            video_length,
+            resolution_name,
+            preset,
+            image_url,
+            parent_post_id,
+            source_image_url,
+            reasoning_effort,
+        )
+        task_ids.append(task_id)
+
+    return {
+        "task_id": task_ids[0],
+        "task_ids": task_ids,
+        "concurrent": concurrent,
+        "aspect_ratio": aspect_ratio,
+        "parent_post_id": parent_post_id,
+    }
 
 
 @router.get("/video/sse")
@@ -203,10 +280,33 @@ async def public_video_sse(request: Request, task_id: str = Query("")):
     resolution_name = str(session.get("resolution_name") or "480p")
     preset = str(session.get("preset") or "normal")
     image_url = session.get("image_url")
+    parent_post_id = str(session.get("parent_post_id") or "").strip()
+    source_image_url = str(session.get("source_image_url") or "").strip() or None
+    if parent_post_id:
+        source_image_url = _build_imagine_public_url(parent_post_id)
     reasoning_effort = session.get("reasoning_effort")
 
     async def event_stream():
         try:
+            preferred_token = None
+            if parent_post_id:
+                try:
+                    preferred_token = await imagine_public_api._get_bound_image_token(
+                        parent_post_id
+                    )
+                except Exception:
+                    preferred_token = None
+                if preferred_token:
+                    logger.info(
+                        "Public video token bound hit: "
+                        f"parent_post_id={parent_post_id}, token={_mask_token(preferred_token)}"
+                    )
+                else:
+                    logger.info(
+                        "Public video token bound miss: "
+                        f"parent_post_id={parent_post_id}"
+                    )
+
             model_id = "grok-imagine-1.0-video"
             model_info = ModelService.get(model_id)
             if not model_info or not model_info.is_video:
@@ -240,6 +340,9 @@ async def public_video_sse(request: Request, task_id: str = Query("")):
                 video_length=video_length,
                 resolution=resolution_name,
                 preset=preset,
+                parent_post_id=parent_post_id or None,
+                source_image_url=source_image_url,
+                preferred_token=preferred_token,
             )
 
             async for chunk in stream:
