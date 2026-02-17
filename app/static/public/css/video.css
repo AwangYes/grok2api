@@ -116,9 +116,27 @@ body {
   color: var(--accents-7);
 }
 
+.history-panel .video-item-bar {
+  flex-wrap: nowrap;
+  align-items: center;
+}
+
+.history-panel .video-item-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .history-panel .video-item-actions .geist-button-outline {
   color: var(--accents-7);
   border-color: var(--video-outline);
+}
+
+.history-panel .video-item-actions {
+  flex-shrink: 0;
+  gap: 6px;
 }
 
 .history-panel .video-item-link {

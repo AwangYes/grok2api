@@ -491,10 +491,11 @@
     const downloadBtn = item.querySelector('.video-download');
     const link = item.querySelector('.video-item-link');
     const safeUrl = url || '';
+    const isBlobUrl = /^blob:/i.test(safeUrl);
     item.dataset.url = safeUrl;
     if (link) {
-      link.textContent = safeUrl;
-      link.classList.toggle('has-url', Boolean(safeUrl));
+      link.textContent = isBlobUrl ? '' : safeUrl;
+      link.classList.toggle('has-url', Boolean(safeUrl) && !isBlobUrl);
     }
     if (openBtn) {
       if (safeUrl) {
