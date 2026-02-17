@@ -1,4 +1,5 @@
 (() => {
+  const enhanceStateMap = new WeakMap();
 
   function toast(message, type) {
     if (typeof window.showToast === 'function') {
@@ -45,7 +46,44 @@
         border-color: #6b7788;
         background: #1a2330;
       }
+      .prompt-lang-toggle-btn {
+        position: absolute;
+        right: 110px;
+        bottom: 10px;
+        z-index: 3;
+        height: 30px;
+        min-width: 48px;
+        padding: 0 10px;
+        border-radius: 8px;
+        background: var(--bg);
+        border-color: var(--border);
+        color: var(--fg);
+        cursor: pointer;
+        user-select: none;
+        display: none;
+      }
+      .prompt-lang-toggle-btn.is-mobile {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .prompt-lang-toggle-btn:hover {
+        border-color: #000;
+      }
+      html[data-theme='dark'] .prompt-lang-toggle-btn {
+        background: #111821;
+        border-color: #3b4654;
+        color: var(--fg);
+      }
+      html[data-theme='dark'] .prompt-lang-toggle-btn:hover {
+        border-color: #6b7788;
+        background: #1a2330;
+      }
       .prompt-enhance-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .prompt-lang-toggle-btn:disabled {
         opacity: 0.5;
         cursor: not-allowed;
       }
@@ -104,20 +142,83 @@
     return text;
   }
 
-  async function onEnhanceClick(textarea, button) {
+  function isMobileViewport() {
+    return window.matchMedia('(max-width: 768px)').matches;
+  }
+
+  function parseEnhancedPrompt(text) {
+    const raw = String(text || '').trim();
+    const enMatch = raw.match(/最终提示词：\s*([\s\S]*?)\s*中文参考版：/);
+    const zhMatch = raw.match(/中文参考版：\s*([\s\S]*?)\s*可调参数：/);
+    return {
+      en: enMatch && enMatch[1] ? String(enMatch[1]).trim() : '',
+      zh: zhMatch && zhMatch[1] ? String(zhMatch[1]).trim() : '',
+      raw,
+    };
+  }
+
+  function applyPromptToTextarea(textarea, value) {
+    textarea.value = value;
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function updateToggleButtonText(toggleBtn, mode) {
+    toggleBtn.textContent = mode === 'zh' ? '中文' : 'EN';
+  }
+
+  function applyEnhancedByMode(textarea, toggleBtn, mode) {
+    const state = enhanceStateMap.get(textarea);
+    if (!state) return;
+    if (mode === 'en' && state.en) {
+      state.mode = 'en';
+      applyPromptToTextarea(textarea, state.en);
+    } else if (mode === 'zh' && state.zh) {
+      state.mode = 'zh';
+      applyPromptToTextarea(textarea, state.zh);
+    } else {
+      applyPromptToTextarea(textarea, state.raw);
+    }
+    enhanceStateMap.set(textarea, state);
+    updateToggleButtonText(toggleBtn, state.mode);
+  }
+
+  async function onEnhanceClick(textarea, enhanceBtn, toggleBtn) {
     const raw = String(textarea.value || '').trim();
     if (!raw) {
       toast('请先输入提示词', 'warning');
       return;
     }
-    const prevText = button.textContent;
-    button.disabled = true;
-    button.textContent = '增强中...';
+    const prevText = enhanceBtn.textContent;
+    enhanceBtn.disabled = true;
+    toggleBtn.disabled = true;
+    enhanceBtn.textContent = '增强中...';
     try {
       const enhanced = await callEnhanceApi(raw);
-      textarea.value = enhanced;
-      textarea.dispatchEvent(new Event('input', { bubbles: true }));
-      textarea.dispatchEvent(new Event('change', { bubbles: true }));
+      const parsed = parseEnhancedPrompt(enhanced);
+      const mode = isMobileViewport() ? ((enhanceStateMap.get(textarea) || {}).mode || 'zh') : 'raw';
+      enhanceStateMap.set(textarea, {
+        en: parsed.en,
+        zh: parsed.zh,
+        raw: parsed.raw,
+        mode,
+      });
+
+      if (isMobileViewport() && (parsed.en || parsed.zh)) {
+        if (mode === 'en' && parsed.en) {
+          applyPromptToTextarea(textarea, parsed.en);
+        } else if (parsed.zh) {
+          applyPromptToTextarea(textarea, parsed.zh);
+          const state = enhanceStateMap.get(textarea);
+          state.mode = 'zh';
+          enhanceStateMap.set(textarea, state);
+        } else {
+          applyPromptToTextarea(textarea, parsed.raw);
+        }
+      } else {
+        applyPromptToTextarea(textarea, parsed.raw);
+      }
+      updateToggleButtonText(toggleBtn, (enhanceStateMap.get(textarea) || {}).mode || 'zh');
       toast('提示词增强完成', 'success');
     } catch (e) {
       const msg = String(e && e.message ? e.message : e);
@@ -127,8 +228,9 @@
         toast(`提示词增强失败: ${msg}`, 'error');
       }
     } finally {
-      button.disabled = false;
-      button.textContent = prevText;
+      enhanceBtn.disabled = false;
+      toggleBtn.disabled = false;
+      enhanceBtn.textContent = prevText;
     }
   }
 
@@ -143,11 +245,29 @@
     parent.insertBefore(wrapper, textarea);
     wrapper.appendChild(textarea);
 
+    const langBtn = document.createElement('button');
+    langBtn.type = 'button';
+    langBtn.className = 'geist-button-outline prompt-lang-toggle-btn';
+    if (isMobileViewport()) {
+      langBtn.classList.add('is-mobile');
+    }
+    updateToggleButtonText(langBtn, 'zh');
+    langBtn.addEventListener('click', () => {
+      const state = enhanceStateMap.get(textarea);
+      if (!state || (!state.en && !state.zh)) {
+        toast('请先增强提示词', 'warning');
+        return;
+      }
+      const nextMode = (state.mode || 'zh') === 'zh' ? 'en' : 'zh';
+      applyEnhancedByMode(textarea, langBtn, nextMode);
+    });
+    wrapper.appendChild(langBtn);
+
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'geist-button-outline prompt-enhance-btn';
     button.textContent = '增强提示词';
-    button.addEventListener('click', () => onEnhanceClick(textarea, button));
+    button.addEventListener('click', () => onEnhanceClick(textarea, button, langBtn));
     wrapper.appendChild(button);
 
     textarea.dataset.promptEnhancerMounted = '1';
