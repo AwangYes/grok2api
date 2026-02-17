@@ -116,18 +116,23 @@ class GrokChatService:
         token: str,
         message: str,
         model: str = "grok-3",
+        requested_model: str | None = None,
         mode: str = None,
         stream: bool = None,
         file_attachments: List[str] = None,
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
+        image_generation_count: int | None = None,
     ):
         """发送聊天请求"""
         if stream is None:
             stream = get_config("app.stream")
 
         logger.debug(
-            f"Chat request: model={model}, mode={mode}, stream={stream}, attachments={len(file_attachments or [])}"
+            "Chat request: "
+            f"requested_model={requested_model or model}, "
+            f"upstream_model={model}, mode={mode}, stream={stream}, "
+            f"attachments={len(file_attachments or [])}"
         )
 
         browser = get_config("proxy.browser")
@@ -141,20 +146,27 @@ class GrokChatService:
                         token,
                         message=message,
                         model=model,
+                        requested_model=requested_model,
                         mode=mode,
                         file_attachments=file_attachments,
                         tool_overrides=tool_overrides,
                         model_config_override=model_config_override,
+                        image_generation_count=image_generation_count,
                     )
-                    logger.info(f"Chat connected: model={model}, stream={stream}")
+                    logger.info(
+                        "Chat connected: "
+                        f"requested_model={requested_model or model}, "
+                        f"upstream_model={model}, mode={mode}, stream={stream}"
+                    )
                     async for line in stream_response:
                         yield line
             except Exception:
+                raise
+            finally:
                 try:
                     await session.close()
                 except Exception:
                     pass
-                raise
 
         return _stream()
 
@@ -215,6 +227,7 @@ class GrokChatService:
             token,
             message,
             grok_model,
+            requested_model=model,
             mode,
             stream,
             file_attachments=all_attachments,
