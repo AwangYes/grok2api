@@ -1954,7 +1954,14 @@
       const prefix = ffTaskPrefix('concat');
       const segASource = `${prefix}_a_source.mp4`;
       const segBSource = `${prefix}_b_source.mp4`;
+      const segAVideo = `${prefix}_a_video.mp4`;
+      const segBVideo = `${prefix}_b_video.mp4`;
+      const segAAudio = `${prefix}_a_audio.m4a`;
+      const segBAudio = `${prefix}_b_audio.m4a`;
+      const listVideo = `${prefix}_video_list.txt`;
+      const listAudio = `${prefix}_audio_list.txt`;
       const mergedVideoFile = `${prefix}_merged_video.mp4`;
+      const mergedAudioFile = `${prefix}_merged_audio.m4a`;
       const mergedFile = `${prefix}_merged.mp4`;
       try {
         const trimSeconds = (Math.max(0, lockedTimestampMs) / 1000).toFixed(3);
@@ -1963,7 +1970,46 @@
         }
         await ffmpegWriteFile(ff, segASource, sourceStable);
         await ffmpegWriteFile(ff, segBSource, generatedBuffer);
+
         try {
+          await ffmpegExec(
+            ff,
+            [
+              '-y',
+              '-i', segASource,
+              '-t', trimSeconds,
+              '-map', '0:v:0',
+              '-c', 'copy',
+              segAVideo
+            ]
+          );
+          await ffmpegExec(
+            ff,
+            [
+              '-y',
+              '-i', segBSource,
+              '-map', '0:v:0',
+              '-c', 'copy',
+              segBVideo
+            ]
+          );
+          await ffmpegWriteFile(
+            ff,
+            listVideo,
+            new TextEncoder().encode(`file '${segAVideo}'\nfile '${segBVideo}'\n`)
+          );
+          await ffmpegExec(
+            ff,
+            [
+              '-y',
+              '-f', 'concat',
+              '-safe', '0',
+              '-i', listVideo,
+              '-c', 'copy',
+              mergedVideoFile
+            ]
+          );
+        } catch (videoCopyErr) {
           await ffmpegExec(
             ff,
             [
@@ -1981,52 +2027,88 @@
               mergedVideoFile
             ]
           );
-        } catch (videoFallbackErr) {
-          await ffmpegExec(
-            ff,
-            [
-              '-y',
-              '-i', segASource,
-              '-i', segBSource,
-              '-filter_complex',
-              `[0:v]trim=end=${trimSeconds},setpts=PTS-STARTPTS[v0];[1:v]setpts=PTS-STARTPTS[v1];[v0][v1]concat=n=2:v=1:a=0[v]`,
-              '-map', '[v]',
-              '-c:v', 'libx264',
-              '-preset', 'ultrafast',
-              '-pix_fmt', 'yuv420p',
-              '-r', '30',
-              mergedVideoFile
-            ]
-          );
         }
+
+        let mergedWithAudio = false;
         try {
           await ffmpegExec(
             ff,
             [
               '-y',
-              '-i', mergedVideoFile,
-              '-t', trimSeconds,
               '-i', segASource,
-              '-map', '0:v',
-              '-map', '1:a?',
-              '-c:v', 'copy',
-              '-c:a', 'aac',
-              '-ar', '48000',
-              '-ac', '2',
+              '-t', trimSeconds,
+              '-map', '0:a:0',
+              '-c', 'copy',
+              segAAudio
+            ]
+          );
+          await ffmpegExec(
+            ff,
+            [
+              '-y',
+              '-i', segBSource,
+              '-map', '0:a:0',
+              '-c', 'copy',
+              segBAudio
+            ]
+          );
+          await ffmpegWriteFile(
+            ff,
+            listAudio,
+            new TextEncoder().encode(`file '${segAAudio}'\nfile '${segBAudio}'\n`)
+          );
+          await ffmpegExec(
+            ff,
+            [
+              '-y',
+              '-f', 'concat',
+              '-safe', '0',
+              '-i', listAudio,
+              '-c', 'copy',
+              mergedAudioFile
+            ]
+          );
+          await ffmpegExec(
+            ff,
+            [
+              '-y',
+              '-i', mergedVideoFile,
+              '-i', mergedAudioFile,
+              '-map', '0:v:0',
+              '-map', '1:a:0',
+              '-c', 'copy',
               '-shortest',
               mergedFile
             ]
           );
+          mergedWithAudio = true;
         } catch (audioMuxErr) {
-          const mergedOnly = await ffmpegReadFile(ff, mergedVideoFile);
-          return new Blob([toStableUint8(mergedOnly)], { type: 'video/mp4' });
+          mergedWithAudio = false;
+        }
+        if (!mergedWithAudio) {
+          await ffmpegExec(
+            ff,
+            [
+              '-y',
+              '-i', mergedVideoFile,
+              '-c', 'copy',
+              mergedFile
+            ]
+          );
         }
         const merged = await ffmpegReadFile(ff, mergedFile);
         return new Blob([toStableUint8(merged)], { type: 'video/mp4' });
       } finally {
         await ffmpegDeleteFileSafe(ff, segASource);
         await ffmpegDeleteFileSafe(ff, segBSource);
+        await ffmpegDeleteFileSafe(ff, segAVideo);
+        await ffmpegDeleteFileSafe(ff, segBVideo);
+        await ffmpegDeleteFileSafe(ff, segAAudio);
+        await ffmpegDeleteFileSafe(ff, segBAudio);
+        await ffmpegDeleteFileSafe(ff, listVideo);
+        await ffmpegDeleteFileSafe(ff, listAudio);
         await ffmpegDeleteFileSafe(ff, mergedVideoFile);
+        await ffmpegDeleteFileSafe(ff, mergedAudioFile);
         await ffmpegDeleteFileSafe(ff, mergedFile);
       }
     };
