@@ -676,6 +676,29 @@
     }
   }
 
+  async function resetFfmpegInstance() {
+    if (!ffmpegInstance) return;
+    try {
+      if (typeof ffmpegInstance.terminate === 'function') {
+        await ffmpegInstance.terminate();
+      }
+    } catch (e) {
+      // ignore
+    }
+    ffmpegInstance = null;
+    ffmpegLoaded = false;
+    ffmpegLoading = false;
+  }
+
+  function ffTaskPrefix(tag) {
+    return `${tag}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function isFsError(e) {
+    const msg = String(e && e.message ? e.message : e);
+    return msg.includes('FS error') || msg.includes('ErrnoError');
+  }
+
   function toStableUint8(input) {
     if (input instanceof Uint8Array) {
       return new Uint8Array(input);
@@ -1413,13 +1436,19 @@
   }
 
   async function extractFrameAtCurrentPoint(videoUrl) {
-    const ff = await ensureFfmpeg();
     const srcBuffer = await fetchArrayBuffer(videoUrl);
-    try {
-      await ffmpegWriteFile(ff, 'edit_input.mp4', srcBuffer);
+
+    const runOnce = async () => {
+      await resetFfmpegInstance();
+      const ff = await ensureFfmpeg();
+      const prefix = ffTaskPrefix('edit');
+      const inputName = `${prefix}_input.mp4`;
+      const frameName = `${prefix}_frame.png`;
+      try {
+      await ffmpegWriteFile(ff, inputName, srcBuffer);
       const seconds = (Math.max(0, lockedTimestampMs) / 1000).toFixed(3);
-      await ffmpegExec(ff, ['-y', '-ss', seconds, '-i', 'edit_input.mp4', '-frames:v', '1', 'edit_frame.png']);
-      const frameBytes = await ffmpegReadFile(ff, 'edit_frame.png');
+      await ffmpegExec(ff, ['-y', '-ss', seconds, '-i', inputName, '-frames:v', '1', frameName]);
+      const frameBytes = await ffmpegReadFile(ff, frameName);
       const frameHash = await sha256Hex(frameBytes);
       const sourceHash = await sha256Hex(srcBuffer);
       let binary = '';
@@ -1436,53 +1465,83 @@
         sourceHash,
         sourceBuffer: toStableArrayBuffer(srcBuffer),
       };
-    } finally {
-      await ffmpegDeleteFileSafe(ff, 'edit_input.mp4');
-      await ffmpegDeleteFileSafe(ff, 'edit_frame.png');
+      } finally {
+        await ffmpegDeleteFileSafe(ff, inputName);
+        await ffmpegDeleteFileSafe(ff, frameName);
+      }
+    };
+
+    try {
+      return await runOnce();
+    } catch (e) {
+      if (isFsError(e)) {
+        return await runOnce();
+      }
+      throw e;
     }
   }
 
   async function concatVideosLocal(sourceBuffer, generatedVideoUrl) {
-    const ff = await ensureFfmpeg();
     const generatedBuffer = await fetchArrayBuffer(generatedVideoUrl);
     const sourceStable = toStableArrayBuffer(sourceBuffer);
-    try {
-      await ffmpegWriteFile(ff, 'seg_a_source.mp4', sourceStable);
-      await ffmpegWriteFile(ff, 'seg_b_source.mp4', generatedBuffer);
+
+    const runOnce = async () => {
+      await resetFfmpegInstance();
+      const ff = await ensureFfmpeg();
+      const prefix = ffTaskPrefix('concat');
+      const segASource = `${prefix}_a_source.mp4`;
+      const segBSource = `${prefix}_b_source.mp4`;
+      const segA = `${prefix}_a.mp4`;
+      const segB = `${prefix}_b.mp4`;
+      const listFile = `${prefix}_list.txt`;
+      const mergedFile = `${prefix}_merged.mp4`;
+      try {
+      await ffmpegWriteFile(ff, segASource, sourceStable);
+      await ffmpegWriteFile(ff, segBSource, generatedBuffer);
       const trimSeconds = (Math.max(0, lockedTimestampMs) / 1000).toFixed(3);
       if (Number(trimSeconds) > 0) {
         await ffmpegExec(
           ff,
-          ['-y', '-i', 'seg_a_source.mp4', '-t', trimSeconds, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', 'seg_a.mp4']
+          ['-y', '-i', segASource, '-t', trimSeconds, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', segA]
         );
         await ffmpegExec(
           ff,
-          ['-y', '-i', 'seg_b_source.mp4', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', 'seg_b.mp4']
+          ['-y', '-i', segBSource, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', segB]
         );
         await ffmpegWriteFile(
           ff,
-          'concat_list.txt',
-          new TextEncoder().encode("file 'seg_a.mp4'\nfile 'seg_b.mp4'\n")
+          listFile,
+          new TextEncoder().encode(`file '${segA}'\nfile '${segB}'\n`)
         );
         await ffmpegExec(
           ff,
-          ['-y', '-f', 'concat', '-safe', '0', '-i', 'concat_list.txt', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', 'merged.mp4']
+          ['-y', '-f', 'concat', '-safe', '0', '-i', listFile, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', mergedFile]
         );
       } else {
         await ffmpegExec(
           ff,
-          ['-y', '-i', 'seg_b_source.mp4', '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', 'merged.mp4']
+          ['-y', '-i', segBSource, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', mergedFile]
         );
       }
-      const merged = await ffmpegReadFile(ff, 'merged.mp4');
+      const merged = await ffmpegReadFile(ff, mergedFile);
       return new Blob([toStableUint8(merged)], { type: 'video/mp4' });
-    } finally {
-      await ffmpegDeleteFileSafe(ff, 'seg_a_source.mp4');
-      await ffmpegDeleteFileSafe(ff, 'seg_b_source.mp4');
-      await ffmpegDeleteFileSafe(ff, 'seg_a.mp4');
-      await ffmpegDeleteFileSafe(ff, 'seg_b.mp4');
-      await ffmpegDeleteFileSafe(ff, 'concat_list.txt');
-      await ffmpegDeleteFileSafe(ff, 'merged.mp4');
+      } finally {
+        await ffmpegDeleteFileSafe(ff, segASource);
+        await ffmpegDeleteFileSafe(ff, segBSource);
+        await ffmpegDeleteFileSafe(ff, segA);
+        await ffmpegDeleteFileSafe(ff, segB);
+        await ffmpegDeleteFileSafe(ff, listFile);
+        await ffmpegDeleteFileSafe(ff, mergedFile);
+      }
+    };
+
+    try {
+      return await runOnce();
+    } catch (e) {
+      if (isFsError(e)) {
+        return await runOnce();
+      }
+      throw e;
     }
   }
 
