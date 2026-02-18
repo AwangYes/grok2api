@@ -2,7 +2,10 @@
 Reverse interface: download asset.
 """
 
+import asyncio
 import urllib.parse
+import urllib.request
+from dataclasses import dataclass
 from typing import Any
 from pathlib import Path
 from curl_cffi.requests import AsyncSession
@@ -28,6 +31,38 @@ _CONTENT_TYPES = {
 
 class AssetsDownloadReverse:
     """assets.grok.com/{path} reverse interface."""
+
+    @dataclass
+    class _SimpleResponse:
+        status_code: int
+        headers: dict[str, str]
+        content: bytes
+
+        async def aiter_content(self, chunk_size: int = 64 * 1024):
+            data = self.content or b""
+            for i in range(0, len(data), chunk_size):
+                yield data[i:i + chunk_size]
+
+    @staticmethod
+    async def _urllib_get(url: str, headers: dict[str, str], timeout: int) -> "AssetsDownloadReverse._SimpleResponse":
+        """使用标准库 urllib 兜底下载，绕过 curl TLS 实现。"""
+        req = urllib.request.Request(url=url, headers=headers, method="GET")
+
+        def _do_get():
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                body = resp.read()
+                raw_headers = {}
+                for k, v in dict(resp.headers.items()).items():
+                    raw_headers[str(k).lower()] = str(v)
+                return status, raw_headers, body
+
+        status, raw_headers, body = await asyncio.to_thread(_do_get)
+        return AssetsDownloadReverse._SimpleResponse(
+            status_code=status,
+            headers=raw_headers,
+            content=body,
+        )
 
     @staticmethod
     async def request(session: AsyncSession, token: str, file_path: str) -> Any:
@@ -107,7 +142,29 @@ class AssetsDownloadReverse:
                         "AssetsDownloadReverse primary request failed, fallback direct: "
                         f"error={first_err}"
                     )
-                    return await _single_get(use_impersonate=False, use_proxy=False)
+                    try:
+                        return await _single_get(use_impersonate=False, use_proxy=False)
+                    except Exception as second_err:
+                        # curl 栈仍失败时，使用标准库 urllib 再兜底一次，绕开 curl TLS 实现。
+                        logger.warning(
+                            "AssetsDownloadReverse direct curl request failed, "
+                            f"fallback urllib: error={second_err}"
+                        )
+                        fallback_resp = await AssetsDownloadReverse._urllib_get(
+                            url=url,
+                            headers=headers,
+                            timeout=timeout,
+                        )
+                        if fallback_resp.status_code != 200:
+                            logger.error(
+                                f"AssetsDownloadReverse: Download failed, {fallback_resp.status_code}",
+                                extra={"error_type": "UpstreamException"},
+                            )
+                            raise UpstreamException(
+                                message=f"AssetsDownloadReverse: Download failed, {fallback_resp.status_code}",
+                                details={"status": fallback_resp.status_code},
+                            )
+                        return fallback_resp
 
             return await retry_on_status(_do_request)
 
